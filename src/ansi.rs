@@ -330,8 +330,9 @@ impl<T: Timeout> Processor<T> {
     {
         // Process all synchronized bytes.
         //
-        // NOTE: We do not use `advance_until_terminated` here since BSU sequences are
-        // processed automatically during the synchronized update.
+        // NOTE: We do not use `advance_until_terminated` here since BSU
+        // sequences are processed automatically during the synchronized
+        // update.
         let buffer = mem::take(&mut self.state.sync_state.buffer);
         let offset = bsu_offset.unwrap_or(buffer.len());
         let mut performer = Performer::new(&mut self.state, handler);
@@ -371,7 +372,8 @@ impl<T: Timeout> Processor<T> {
     where
         H: Handler,
     {
-        // Advance sync parser or stop sync if we'd exceed the maximum buffer size.
+        // Advance sync parser or stop sync if we'd exceed the maximum buffer
+        // size.
         if self.state.sync_state.buffer.len() + bytes.len() >= SYNC_BUFFER_SIZE - 1 {
             // Terminate the synchronized update.
             self.stop_sync_internal(handler, None);
@@ -391,7 +393,8 @@ impl<T: Timeout> Processor<T> {
     where
         H: Handler,
     {
-        // Get constraints within which a new escape character might be relevant.
+        // Get constraints within which a new escape character might be
+        // relevant.
         let buffer_len = self.state.sync_state.buffer.len();
         let start_offset = (buffer_len - new_bytes).saturating_sub(SYNC_ESCAPE_LEN - 1);
         let end_offset = buffer_len.saturating_sub(SYNC_ESCAPE_LEN - 1);
@@ -399,9 +402,9 @@ impl<T: Timeout> Processor<T> {
 
         // Search for termination/extension escapes in the added bytes.
         //
-        // NOTE: It is technically legal to specify multiple private modes in the same
-        // escape, but we only allow EXACTLY `\e[?2026h`/`\e[?2026l` to keep the parser
-        // more simple.
+        // NOTE: It is technically legal to specify multiple private modes in
+        // the same escape, but we only allow EXACTLY
+        // `\e[?2026h`/`\e[?2026l` to keep the parser more simple.
         let mut bsu_offset = None;
         for index in memchr::memchr_iter(0x1B, search_buffer).rev() {
             let offset = start_offset + index;
@@ -493,6 +496,17 @@ pub trait Timeout: Default {
 /// XXX Should probably not provide default impls for everything, but it makes
 /// writing specific handler impls for tests far easier.
 pub trait Handler {
+    /// Maximum OSC payload size. See [`crate::Perform::osc_max_bytes`].
+    fn osc_max_bytes(&self, _command: Option<&[u8]>) -> usize {
+        usize::MAX
+    }
+
+    /// Dispatch an OSC command not recognized by this processor.
+    ///
+    /// Invoked in parser order, including when synchronized output is released.
+    /// Parameters borrow the parser buffer and must be copied to retain them.
+    fn unhandled_osc(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+
     /// OSC to set window title.
     fn set_title(&mut self, _: Option<String>) {}
 
@@ -1326,6 +1340,11 @@ where
     }
 
     #[inline]
+    fn osc_max_bytes(&self, command: Option<&[u8]>) -> usize {
+        self.handler.osc_max_bytes(command)
+    }
+
+    #[inline]
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
 
@@ -1338,7 +1357,7 @@ where
                 }
                 buf.push_str("],");
             }
-            debug!("[unhandled osc_dispatch]: [{}] at line {}", &buf, line!());
+            debug!("[unhandled osc_dispatch]: [{}] at line {}", buf, line!());
         }
 
         if params.is_empty() || params[0].is_empty() {
@@ -1393,8 +1412,9 @@ where
             b"8" if params.len() > 2 => {
                 let link_params = params[1];
 
-                // NOTE: The escape sequence is of form 'OSC 8 ; params ; URI ST', where
-                // URI is URL-encoded. However `;` is a special character and might be
+                // NOTE: The escape sequence is of form 'OSC 8 ; params ; URI
+                // ST', where URI is URL-encoded. However `;` is
+                // a special character and might be
                 // passed as is, thus we need to rebuild the URI.
                 let mut uri = str::from_utf8(params[2]).unwrap_or_default().to_string();
                 for param in params[3..].iter() {
@@ -1402,14 +1422,15 @@ where
                     uri.push_str(str::from_utf8(param).unwrap_or_default());
                 }
 
-                // The OSC 8 escape sequence must be stopped when getting an empty `uri`.
+                // The OSC 8 escape sequence must be stopped when getting an
+                // empty `uri`.
                 if uri.is_empty() {
                     self.handler.set_hyperlink(None);
                     return;
                 }
 
-                // Link parameters are in format of `key1=value1:key2=value2`. Currently only
-                // key `id` is defined.
+                // Link parameters are in format of `key1=value1:key2=value2`.
+                // Currently only key `id` is defined.
                 let id = link_params
                     .split(|&b| b == b':')
                     .find_map(|kv| kv.strip_prefix(b"id="))
@@ -1423,7 +1444,8 @@ where
                 if params.len() >= 2 {
                     if let Some(mut dynamic_code) = parse_number(params[0]) {
                         for param in &params[1..] {
-                            // 10 is the first dynamic color, also the foreground.
+                            // 10 is the first dynamic color, also the
+                            // foreground.
                             let offset = dynamic_code as usize - 10;
                             let index = NamedColor::Foreground as usize + offset;
 
@@ -1520,7 +1542,10 @@ where
             // Reset text cursor color.
             b"112" => self.handler.reset_color(NamedColor::Cursor as usize),
 
-            _ => unhandled(params),
+            _ => {
+                self.handler.unhandled_osc(params, bell_terminated);
+                unhandled(params);
+            },
         }
     }
 
@@ -2016,6 +2041,90 @@ pub mod C0 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct OscHandler {
+        events: Vec<String>,
+        clipboard: Vec<u8>,
+        hyperlink: Option<Hyperlink>,
+    }
+
+    impl Handler for OscHandler {
+        fn osc_max_bytes(&self, command: Option<&[u8]>) -> usize {
+            match command {
+                Some(b"8" | b"52") => usize::MAX,
+                _ => 4096,
+            }
+        }
+
+        fn clipboard_store(&mut self, _: u8, text: &[u8]) {
+            self.clipboard = text.to_vec();
+        }
+
+        fn set_hyperlink(&mut self, hyperlink: Option<Hyperlink>) {
+            self.hyperlink = hyperlink;
+        }
+
+        fn input(&mut self, c: char) {
+            self.events.push(c.to_string());
+        }
+
+        fn unhandled_osc(&mut self, params: &[&[u8]], _: bool) {
+            self.events.push(
+                params.iter().map(|p| String::from_utf8_lossy(p)).collect::<Vec<_>>().join(";"),
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_osc_dispatch_waits_for_sync_release_or_timeout() {
+        for timeout in [false, true] {
+            for chunk_size in [1, 2, 7, 128] {
+                let mut parser = Processor::<TestSyncHandler>::new();
+                let mut handler = OscHandler::default();
+                parser.advance(&mut handler, b"\x1b[?2026h");
+                let input = b"a\x1b]133;A\x07b\x1b]7;file:///tmp\x1b\\c";
+                for chunk in input.chunks(chunk_size) {
+                    parser.advance(&mut handler, chunk);
+                }
+                assert!(handler.events.is_empty());
+                if timeout {
+                    parser.stop_sync(&mut handler);
+                } else {
+                    parser.advance(&mut handler, b"\x1b[?2026l");
+                }
+                assert_eq!(handler.events, ["a", "133;A", "b", "7;file:///tmp", "c"]);
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn selective_limits_preserve_clipboard_and_hyperlink_dispatch() {
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = OscHandler::default();
+        let payload = "A".repeat(64 * 1024);
+        let input =
+            format!("\x1b]52;c;{payload}\x07\x1b]8;id=example;https://example.org/a;b\x1b\\");
+        parser.advance(&mut handler, input.as_bytes());
+        assert_eq!(handler.clipboard, payload.as_bytes());
+        let hyperlink = handler.hyperlink.as_ref().unwrap();
+        assert_eq!(hyperlink.id.as_deref(), Some("example"));
+        assert_eq!(hyperlink.uri, "https://example.org/a;b");
+        assert!(handler.events.is_empty());
+        parser.advance(&mut handler, b"\x1b]8;;\x07");
+        assert!(handler.hyperlink.is_none());
+    }
+
+    #[test]
+    fn oversized_unknown_osc_is_not_dispatched_by_ansi_processor() {
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = OscHandler::default();
+        parser.advance(&mut handler, b"\x1b]133;A;");
+        parser.advance(&mut handler, &[b'a'; 4096]);
+        parser.advance(&mut handler, b"\x07x\x1b]133;A\x07");
+        assert_eq!(handler.events, ["x", "133;A"]);
+    }
 
     #[derive(Default)]
     pub struct TestSyncHandler {

@@ -66,6 +66,9 @@ pub struct Parser<const OSC_RAW_BUF_SIZE: usize = MAX_OSC_RAW> {
     osc_raw: Vec<u8>,
     osc_params: [(usize, usize); MAX_OSC_PARAMS],
     osc_num_params: usize,
+    osc_bytes: usize,
+    osc_max_bytes: usize,
+    osc_ignoring: bool,
     ignoring: bool,
     partial_utf8: [u8; 4],
     partial_utf8_len: usize,
@@ -374,6 +377,9 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             0x5D => {
                 self.osc_raw.clear();
                 self.osc_num_params = 0;
+                self.osc_bytes = 0;
+                self.osc_max_bytes = performer.osc_max_bytes(None);
+                self.osc_ignoring = false;
                 self.state = State::OscString
             },
             0x5E..=0x5F => self.state = State::SosPmApcString,
@@ -407,6 +413,18 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
     #[inline(always)]
     fn advance_osc_string<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        // Select the command-specific limit before accounting for its first
+        // separator.
+        if byte == b';' && self.osc_num_params == 0 && !self.osc_ignoring {
+            self.osc_max_bytes = performer.osc_max_bytes(Some(&self.osc_raw));
+        }
+        if !matches!(byte, 0x07 | 0x18 | 0x1A | 0x1B) {
+            if self.osc_bytes >= self.osc_max_bytes {
+                self.osc_ignoring = true;
+            } else {
+                self.osc_bytes += 1;
+            }
+        }
         match byte {
             0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1C..=0x1F => (),
             0x07 => {
@@ -423,15 +441,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 self.reset_params();
                 self.state = State::Escape
             },
-            0x3B => {
-                #[cfg(not(feature = "std"))]
-                {
-                    if self.osc_raw.is_full() {
-                        return;
-                    }
-                }
-                self.action_osc_put_param()
-            },
+            0x3B => self.action_osc_put_param(),
             _ => self.action_osc_put(byte),
         }
     }
@@ -521,6 +531,9 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     /// Add OSC param separator.
     #[inline]
     fn action_osc_put_param(&mut self) {
+        if self.osc_ignoring {
+            return;
+        }
         let idx = self.osc_raw.len();
 
         let param_idx = self.osc_num_params;
@@ -529,7 +542,10 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             0 => self.osc_params[param_idx] = (0, idx),
 
             // Only process up to MAX_OSC_PARAMS.
-            MAX_OSC_PARAMS => return,
+            MAX_OSC_PARAMS => {
+                self.osc_ignoring = true;
+                return;
+            },
 
             // All other params depend on previous indexing.
             _ => {
@@ -544,9 +560,13 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
     #[inline(always)]
     fn action_osc_put(&mut self, byte: u8) {
+        if self.osc_ignoring {
+            return;
+        }
         #[cfg(not(feature = "std"))]
         {
             if self.osc_raw.is_full() {
+                self.osc_ignoring = true;
                 return;
             }
         }
@@ -555,7 +575,9 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
     fn osc_end<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         self.action_osc_put_param();
-        self.osc_dispatch(performer, byte);
+        if !self.osc_ignoring {
+            self.osc_dispatch(performer, byte);
+        }
         self.osc_raw.clear();
         self.osc_num_params = 0;
     }
@@ -613,7 +635,8 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 Self::ground_dispatch(performer, parsed);
                 let mut processed = plain_chars;
 
-                // If there's another character, it must be escape so process it directly.
+                // If there's another character, it must be escape so process it
+                // directly.
                 if processed < num_bytes {
                     self.state = State::Escape;
                     self.reset_params();
@@ -642,7 +665,8 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                         //
                         // While we could theoretically try to just re-parse
                         // `bytes[valid_bytes + len..plain_chars]`, it's easier
-                        // to just skip it and invalid utf8 is pretty rare anyway.
+                        // to just skip it and invalid utf8 is pretty rare
+                        // anyway.
                         valid_bytes + len
                     },
                     None => {
@@ -670,7 +694,8 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     /// Advance the parser while processing a partial utf8 codepoint.
     #[inline]
     fn advance_partial_utf8<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
-        // Try to copy up to 3 more characters, to ensure the codepoint is complete.
+        // Try to copy up to 3 more characters, to ensure the codepoint is
+        // complete.
         let old_bytes = self.partial_utf8_len;
         let to_copy = bytes.len().min(self.partial_utf8.len() - old_bytes);
         self.partial_utf8[old_bytes..old_bytes + to_copy].copy_from_slice(&bytes[..to_copy]);
@@ -688,9 +713,10 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             },
             Err(err) => {
                 let valid_bytes = err.valid_up_to();
-                // If we have any valid bytes, that means we partially copied another
-                // utf8 character into `partial_utf8`. Since we only care about the
-                // first character, we just ignore the rest.
+                // If we have any valid bytes, that means we partially copied
+                // another utf8 character into `partial_utf8`.
+                // Since we only care about the first character,
+                // we just ignore the rest.
                 if valid_bytes > 0 {
                     let c = unsafe {
                         let parsed = str::from_utf8_unchecked(&self.partial_utf8[..valid_bytes]);
@@ -790,6 +816,21 @@ pub trait Perform {
     /// terminated.
     fn unhook(&mut self) {}
 
+    /// Maximum OSC payload bytes, including command, separators, and ignored
+    /// controls.
+    ///
+    /// Called with `None` at the start of an OSC, then with the command bytes
+    /// at its first semicolon. The second limit applies to the entire
+    /// payload. Overflow discards the entire OSC, never dispatching a
+    /// truncated prefix. The default preserves unbounded collection with
+    /// `std`; without `std`, the parser's fixed buffer is an additional
+    /// limit. An OSC exceeding the parameter capacity is also discarded.
+    ///
+    /// A finite `None` limit also bounds unterminated command identifiers.
+    fn osc_max_bytes(&self, _command: Option<&[u8]>) -> usize {
+        usize::MAX
+    }
+
     /// Dispatch an operating system command.
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
 
@@ -836,6 +877,92 @@ mod tests {
     use std::vec::Vec;
 
     use super::*;
+
+    #[derive(Default)]
+    struct BoundedOsc {
+        reports: Vec<Vec<Vec<u8>>>,
+        printed: Vec<char>,
+    }
+
+    impl Perform for BoundedOsc {
+        fn osc_max_bytes(&self, command: Option<&[u8]>) -> usize {
+            match command {
+                Some(b"52") => 128 * 1024,
+                _ => 32,
+            }
+        }
+
+        fn osc_dispatch(&mut self, params: &[&[u8]], _: bool) {
+            self.reports.push(params.iter().map(|param| param.to_vec()).collect());
+        }
+
+        fn print(&mut self, c: char) {
+            self.printed.push(c);
+        }
+    }
+
+    #[test]
+    fn osc_limit_counts_separators_and_controls_and_recovers() {
+        for terminator in [b"\x07".as_slice(), b"\x1b\\".as_slice()] {
+            for chunk_size in [1, 2, 7, 128] {
+                for extra in [b'x', b';', 0] {
+                    let mut parser = Parser::new();
+                    let mut handler = BoundedOsc::default();
+                    let payload = format!("133;A;{}", "a".repeat(26));
+                    let mut input = b"\x1b]".to_vec();
+                    input.extend_from_slice(payload.as_bytes());
+                    input.extend_from_slice(terminator);
+                    input.extend_from_slice(b"\x1b]");
+                    input.extend_from_slice(payload.as_bytes());
+                    input.push(extra);
+                    input.extend_from_slice(terminator);
+                    input.extend_from_slice(b"Z\x1b]133;A\x07");
+                    for chunk in input.chunks(chunk_size) {
+                        parser.advance(&mut handler, chunk);
+                    }
+                    assert_eq!(handler.reports.len(), 2);
+                    assert_eq!(handler.reports[0][2].len(), 26);
+                    assert_eq!(handler.reports[1], vec![b"133".to_vec(), b"A".to_vec()]);
+                    assert_eq!(handler.printed, vec!['Z']);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unterminated_osc_and_command_identifiers_stop_collecting() {
+        for prefix in [b"\x1b]133;A;".as_slice(), b"\x1b]".as_slice()] {
+            let mut parser = Parser::new();
+            let mut handler = BoundedOsc::default();
+            parser.advance(&mut handler, prefix);
+            for _ in 0..1024 {
+                parser.advance(&mut handler, &[b'a'; 1024]);
+            }
+            assert!(parser.osc_raw.len() <= 32);
+            assert!(handler.reports.is_empty());
+            parser.advance(&mut handler, b"\x07\x1b]133;A\x07");
+            assert_eq!(handler.reports.len(), 1);
+        }
+    }
+
+    #[test]
+    fn excessive_osc_parameters_discard_the_whole_report() {
+        let mut parser = Parser::new();
+        let mut handler = BoundedOsc::default();
+        let input = format!("\x1b]7;{}\x07\x1b]133;A\x07", ";".repeat(16));
+        parser.advance(&mut handler, input.as_bytes());
+        assert_eq!(handler.reports, vec![vec![b"133".to_vec(), b"A".to_vec()]]);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn command_specific_limit_preserves_large_clipboard_payloads() {
+        let mut parser = Parser::new();
+        let mut handler = BoundedOsc::default();
+        let input = format!("\x1b]52;c;{}\x07", "A".repeat(64 * 1024));
+        parser.advance(&mut handler, input.as_bytes());
+        assert_eq!(handler.reports[0][2].len(), 64 * 1024);
+    }
 
     const OSC_BYTES: &[u8] = &[
         0x1B, 0x5D, // Begin OSC
@@ -942,14 +1069,7 @@ mod tests {
 
         parser.advance(&mut dispatcher, &input);
 
-        assert_eq!(dispatcher.dispatched.len(), 1);
-        match &dispatcher.dispatched[0] {
-            Sequence::Osc(params, _) => {
-                assert_eq!(params.len(), MAX_OSC_PARAMS);
-                assert!(params.iter().all(Vec::is_empty));
-            },
-            _ => panic!("expected osc sequence"),
-        }
+        assert!(dispatcher.dispatched.is_empty());
     }
 
     #[test]
@@ -1035,27 +1155,29 @@ mod tests {
         // Terminate escape for dispatch
         parser.advance(&mut dispatcher, INPUT_END);
 
-        assert_eq!(dispatcher.dispatched.len(), 1);
-        match &dispatcher.dispatched[0] {
-            Sequence::Osc(params, _) => {
-                assert_eq!(params.len(), 2);
-                assert_eq!(params[0], b"52");
+        #[cfg(not(feature = "std"))]
+        assert!(dispatcher.dispatched.is_empty());
 
-                #[cfg(feature = "std")]
-                assert_eq!(params[1].len(), NUM_BYTES + INPUT_END.len());
-
-                #[cfg(not(feature = "std"))]
-                assert_eq!(params[1].len(), MAX_OSC_RAW - params[0].len());
-            },
-            _ => panic!("expected osc sequence"),
+        #[cfg(feature = "std")]
+        {
+            assert_eq!(dispatcher.dispatched.len(), 1);
+            match &dispatcher.dispatched[0] {
+                Sequence::Osc(params, _) => {
+                    assert_eq!(params.len(), 2);
+                    assert_eq!(params[0], b"52");
+                    assert_eq!(params[1].len(), NUM_BYTES + INPUT_END.len());
+                },
+                _ => panic!("expected osc sequence"),
+            }
         }
     }
 
     #[test]
     fn parse_csi_max_params() {
         // This will build a list of repeating '1;'s
-        // The length is MAX_PARAMS - 1 because the last semicolon is interpreted
-        // as an implicit zero, making the total number of parameters MAX_PARAMS
+        // The length is MAX_PARAMS - 1 because the last semicolon is
+        // interpreted as an implicit zero, making the total number of
+        // parameters MAX_PARAMS
         let params = "1;".repeat(params::MAX_PARAMS - 1);
         let input = format!("\x1b[{}p", &params[..]).into_bytes();
 
@@ -1078,7 +1200,8 @@ mod tests {
     fn parse_csi_params_ignore_long_params() {
         // This will build a list of repeating '1;'s
         // The length is MAX_PARAMS because the last semicolon is interpreted
-        // as an implicit zero, making the total number of parameters MAX_PARAMS + 1
+        // as an implicit zero, making the total number of parameters MAX_PARAMS
+        // + 1
         let params = "1;".repeat(params::MAX_PARAMS);
         let input = format!("\x1b[{}p", &params[..]).into_bytes();
 
@@ -1350,18 +1473,7 @@ mod tests {
         // Terminate escape for dispatch
         parser.advance(&mut dispatcher, INPUT_END);
 
-        assert_eq!(dispatcher.dispatched.len(), 1);
-        match &dispatcher.dispatched[0] {
-            Sequence::Osc(params, _) => {
-                assert_eq!(params.len(), 2);
-                assert_eq!(params[0], b"52");
-                assert_eq!(params[1].len(), OSC_BUFFER_SIZE - params[0].len());
-                for item in params[1].iter() {
-                    assert_eq!(*item, b'a');
-                }
-            },
-            _ => panic!("expected osc sequence"),
-        }
+        assert!(dispatcher.dispatched.is_empty());
     }
 
     #[cfg(not(feature = "std"))]
@@ -1439,9 +1551,10 @@ mod tests {
 
     #[test]
     fn partial_utf8_separating_utf8() {
-        // This is different from the `partial_utf8` test since it has a multi-byte UTF8
-        // character after the partial UTF8 state, causing a partial byte to be present
-        // in the `partial_utf8` buffer after the 2-byte codepoint.
+        // This is different from the `partial_utf8` test since it has a
+        // multi-byte UTF8 character after the partial UTF8 state,
+        // causing a partial byte to be present in the `partial_utf8`
+        // buffer after the 2-byte codepoint.
 
         // "ĸ🎉"
         const INPUT: &[u8] = b"\xC4\xB8\xF0\x9F\x8E\x89";
